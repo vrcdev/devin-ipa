@@ -27,9 +27,9 @@ struct SettingsView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                 } header: {
-                    Text("Organization ID (optional)")
+                    Text("Organization ID")
                 } footer: {
-                    Text("Personal Access Tokens require your org ID (starts with org-); it's sent as the X-Org-Id header. Service-user keys resolve the org automatically.")
+                    Text("Required — the app calls /v3/organizations/{org-id}/…, so this is in every request URL. Find it in the Devin web app under Settings → Organizations.")
                 }
 
                 if let testResult {
@@ -47,12 +47,12 @@ struct SettingsView: View {
                             dismiss()
                         }
                     }
-                    .disabled(token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(canSave)
 
                     Button(testing ? "Testing…" : "Test Connection") {
                         Task { await testConnection() }
                     }
-                    .disabled(token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || testing)
+                    .disabled(canSave || testing)
                 }
             }
             .navigationTitle("Settings")
@@ -69,6 +69,11 @@ struct SettingsView: View {
         }
     }
 
+    private var canSave: Bool {
+        token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || orgID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     private func testConnection() async {
         testing = true
         testResult = nil
@@ -77,7 +82,7 @@ struct SettingsView: View {
             orgID: orgID.trimmingCharacters(in: .whitespacesAndNewlines)
         )
         do {
-            _ = try await client.listSessions(limit: 1)
+            _ = try await client.listSessions(first: 1)
             testResult = "OK — connected"
         } catch {
             testResult = error.localizedDescription

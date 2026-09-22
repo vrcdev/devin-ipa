@@ -33,7 +33,8 @@ struct SessionDetailView: View {
     @EnvironmentObject var appState: AppState
     @Environment(\.dismiss) private var dismiss
 
-    @State private var detail: SessionDetail?
+    @State private var session: Session?
+    @State private var messages: [SessionMessage] = []
     @State private var draft = ""
     @State private var sending = false
     @State private var confirmTerminate = false
@@ -48,7 +49,7 @@ struct SessionDetailView: View {
             Divider()
             composer
         }
-        .navigationTitle(detail?.title ?? "Session")
+        .navigationTitle(session?.title ?? "Session")
         .navigationBarTitleDisplayMode(.inline)
         .task {
             await load()
@@ -80,23 +81,25 @@ struct SessionDetailView: View {
 
     private var header: some View {
         HStack(spacing: 10) {
-            StatusDot(status: detail?.statusEnum ?? detail?.status ?? "")
-            Text((detail?.statusEnum ?? detail?.status ?? "…").replacingOccurrences(of: "_", with: " "))
+            StatusDot(status: session?.statusDetail ?? session?.status ?? "")
+            Text(session?.displayStatus ?? "…")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
-            if let updatedAt = detail?.updatedAt {
+            if let updatedAt = session?.updatedAt {
                 Text("· \(FormatHelper.relative(updatedAt))")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }
             Spacer()
-            if let prURL = detail?.pullRequest?.url, let url = URL(string: prURL) {
+            if let prURL = session?.pullRequests?.first?.prUrl, let url = URL(string: prURL) {
                 Link(destination: url) {
                     Image(systemName: "arrow.triangle.pull")
                 }
             }
-            Link(destination: URL(string: "https://app.devin.ai/sessions/\(sessionID)")!) {
-                Image(systemName: "safari")
+            if let webURL = session?.webURL ?? URL(string: "https://app.devin.ai/sessions/\(sessionID)") {
+                Link(destination: webURL) {
+                    Image(systemName: "safari")
+                }
             }
             Button { confirmTerminate = true } label: {
                 Image(systemName: "stop.circle")
@@ -109,16 +112,16 @@ struct SessionDetailView: View {
     private var messageList: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                if detail == nil {
+                if session == nil {
                     ProgressView("Loading…")
                         .padding(.top, 40)
-                } else if detail?.messages?.isEmpty ?? true {
+                } else if messages.isEmpty {
                     Text("No messages yet")
                         .foregroundStyle(.secondary)
                         .padding(.top, 40)
                 } else {
                     LazyVStack(spacing: 12) {
-                        ForEach(detail?.messages ?? []) { message in
+                        ForEach(messages) { message in
                             MessageBubble(message: message)
                                 .id(message.id)
                         }
@@ -126,8 +129,8 @@ struct SessionDetailView: View {
                     .padding()
                 }
             }
-            .onChange(of: detail?.messages?.count ?? 0) { _ in
-                if let last = detail?.messages?.last {
+            .onChange(of: messages.count) { _ in
+                if let last = messages.last {
                     withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
                 }
             }
@@ -152,9 +155,12 @@ struct SessionDetailView: View {
 
     private func load() async {
         do {
-            detail = try await appState.client.getSession(sessionID)
+            async let fetchedSession = appState.client.getSession(sessionID)
+            async let fetchedMessages = appState.client.listMessages(sessionID)
+            session = try await fetchedSession
+            messages = try await fetchedMessages
         } catch {
-            if detail == nil { errorText = error.localizedDescription }
+            if session == nil { errorText = error.localizedDescription }
         }
     }
 

@@ -1,52 +1,51 @@
 import Foundation
 
-struct SessionSummary: Decodable, Identifiable, Hashable {
+struct Session: Decodable, Identifiable, Hashable {
     let sessionId: String
     let title: String?
     let status: String
-    let statusEnum: String?
-    let createdAt: String
-    let updatedAt: String
+    let statusDetail: String?
+    let url: String?
+    let createdAt: Int
+    let updatedAt: Int
+    let acusConsumed: Double?
     let tags: [String]?
-    let pullRequest: PullRequestInfo?
-    let requestingUserEmail: String?
+    let pullRequests: [SessionPullRequest]?
+    let isArchived: Bool?
 
     var id: String { sessionId }
+
+    var displayStatus: String {
+        (statusDetail ?? status).replacingOccurrences(of: "_", with: " ")
+    }
+
+    var webURL: URL? {
+        if let url, let parsed = URL(string: url) { return parsed }
+        return URL(string: "https://app.devin.ai/sessions/\(sessionId)")
+    }
 }
 
-struct PullRequestInfo: Decodable, Hashable {
-    let url: String
-}
-
-struct ListSessionsResponse: Decodable {
-    let sessions: [SessionSummary]
-}
-
-struct SessionDetail: Decodable {
-    let sessionId: String
-    let title: String?
-    let status: String
-    let statusEnum: String?
-    let createdAt: String
-    let updatedAt: String
-    let messages: [SessionMessage]?
-    let pullRequest: PullRequestInfo?
-    let tags: [String]?
+struct SessionPullRequest: Decodable, Hashable {
+    let prUrl: String?
+    let prState: String?
 }
 
 struct SessionMessage: Decodable, Identifiable, Hashable {
     let eventId: String
     let message: String
-    let timestamp: String
-    let type: String
+    let createdAt: Int
+    let source: String
     let origin: String?
     let username: String?
 
     var id: String { eventId }
+    var isFromUser: Bool { source == "user" }
+}
 
-    var isFromUser: Bool {
-        type.localizedCaseInsensitiveContains("user") && !type.localizedCaseInsensitiveContains("devin")
-    }
+struct PageResponse<Item: Decodable>: Decodable {
+    let items: [Item]
+    let endCursor: String?
+    let hasNextPage: Bool?
 }
 
 struct CreateSessionRequest: Encodable {
@@ -54,26 +53,16 @@ struct CreateSessionRequest: Encodable {
     let title: String?
 }
 
-struct CreateSessionResponse: Decodable {
-    let sessionId: String
-    let url: String
-}
-
 struct SendMessageRequest: Encodable {
     let message: String
 }
 
 enum FormatHelper {
-    static func date(_ string: String) -> Date? {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = formatter.date(from: string) { return date }
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter.date(from: string)
+    static func date(_ timestamp: Int) -> Date {
+        Date(timeIntervalSince1970: TimeInterval(timestamp))
     }
 
-    static func relative(_ string: String) -> String {
-        guard let date = date(string) else { return string }
-        return date.formatted(.relative(presentation: .named))
+    static func relative(_ timestamp: Int) -> String {
+        date(timestamp).formatted(.relative(presentation: .named))
     }
 }

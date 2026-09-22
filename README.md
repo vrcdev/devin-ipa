@@ -13,10 +13,11 @@ A native iOS client for [Devin](https://devin.ai), built in SwiftUI on the publi
 
 ## Setup
 
-1. Get an API token: in the Devin web app go to **Settings → API Keys** and create a Personal Access Token or a service user API key (they start with `cog_`).
-2. Open the app → Settings (gear icon) → paste the token.
-   - Personal Access Tokens also need your **Organization ID** (`org-…`) — it's sent as the `X-Org-Id` header. Service-user keys resolve the org automatically, so you can leave it blank.
+1. Get an API token: in the Devin web app go to **Settings → Devin API** and create a Personal Access Token (PATs tab) or a service user API key (they start with `cog_`).
+2. Open the app → Settings (gear icon) → paste the token and enter your **Organization ID** (`org-…`) — required, since the app uses the `/v3/organizations/{org_id}/…` endpoints. Find it under Settings → Organizations.
 3. Pull to refresh the session list, tap **+** to start a session.
+
+A PAT carries your own permissions (anything you can do in the web app). A service-user key needs the `ViewOrgSessions` / `ManageOrgSessions` org permissions.
 
 ## Building the .ipa (GitHub Actions)
 
@@ -46,6 +47,6 @@ zip -qr DevinMobile.ipa Payload
 
 ## Notes
 
-- API base: `https://api.devin.ai`, v1 endpoints (`GET/POST /v1/sessions`, `GET /v1/sessions/{id}`, `POST /v1/sessions/{id}/message`, `DELETE /v1/sessions/{id}`).
-- The detail view polls session status every 10 s while open.
+- API base: `https://api.devin.ai`, v3 endpoints under `/v3/organizations/{org_id}/sessions` (list, get, create, `/{id}/messages` GET+POST, `DELETE /{id}`). Works with both Personal Access Tokens and service-user keys; v1 endpoints only accept service-user keys.
+- The detail view polls session status + messages every 10 s while open.
 - Deployment target: iOS 16.
