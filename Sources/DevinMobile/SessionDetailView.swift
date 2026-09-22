@@ -18,7 +18,7 @@ struct MessageBubble: View {
                     )
                     .foregroundStyle(message.isFromUser ? .white : .primary)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
-                Text(FormatHelper.relative(message.timestamp))
+                Text(FormatHelper.relative(message.createdAt))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
