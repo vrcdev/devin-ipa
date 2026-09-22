@@ -2,7 +2,7 @@ import Foundation
 
 @MainActor
 final class AppState: ObservableObject {
-    @Published var sessions: [SessionSummary] = []
+    @Published var sessions: [Session] = []
     @Published var isLoading = false
     @Published var errorMessage: String?
     @Published var token: String
