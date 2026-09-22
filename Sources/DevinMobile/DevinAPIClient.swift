@@ -69,6 +69,13 @@ final class DevinAPIClient {
         throw lastError
     }
 
+    /// Identifies what the token authenticates as (pat_user / service_user /
+    /// windsurf_session) and, when bound to one org, returns org_id.
+    func getSelf() async throws -> SelfResponse {
+        let data = try await request("GET", "/v3/self", requiresOrg: false)
+        return try decoder.decode(SelfResponse.self, from: data)
+    }
+
     func getSession(_ sessionID: String) async throws -> Session {
         let data = try await request("GET", "\(Self.sessionsPath(orgID))/\(sessionID)")
         return try decoder.decode(Session.self, from: data)
@@ -141,10 +148,11 @@ final class DevinAPIClient {
         _ method: String,
         _ path: String,
         query: [URLQueryItem] = [],
-        body: Encodable? = nil
+        body: Encodable? = nil,
+        requiresOrg: Bool = true
     ) async throws -> Data {
         guard !token.isEmpty else { throw APIError.missingToken }
-        guard !orgID.isEmpty else { throw APIError.missingOrgID }
+        if requiresOrg, orgID.isEmpty { throw APIError.missingOrgID }
 
         var components = URLComponents(
             url: Self.baseURL.appendingPathComponent(path),
@@ -155,7 +163,9 @@ final class DevinAPIClient {
         var urlRequest = URLRequest(url: components.url!)
         urlRequest.httpMethod = method
         urlRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        urlRequest.setValue(orgID, forHTTPHeaderField: "X-Org-Id")
+        if !orgID.isEmpty {
+            urlRequest.setValue(orgID, forHTTPHeaderField: "X-Org-Id")
+        }
         if let body {
             urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
             urlRequest.httpBody = try JSONEncoder().encode(AnyEncodable(wrapped: body))

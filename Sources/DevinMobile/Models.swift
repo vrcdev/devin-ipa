@@ -57,6 +57,15 @@ struct SendMessageRequest: Encodable {
     let message: String
 }
 
+struct SelfResponse: Decodable {
+    let principalType: String
+    let userId: String?
+    let userName: String?
+    let orgId: String?
+    let apiKeyId: String?
+    let apiKeyName: String?
+}
+
 enum FormatHelper {
     static func date(_ timestamp: Int) -> Date {
         Date(timeIntervalSince1970: TimeInterval(timestamp))
