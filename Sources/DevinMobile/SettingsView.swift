@@ -11,7 +11,7 @@ struct SettingsView: View {
 
     @State private var verifier: String?
     @State private var authURL: URL?
-    @State private var safariURL: URL?
+    @State private var safariPage: SignInPage?
     @State private var codeInput = ""
     @State private var exchanging = false
     @State private var signInStatus: String?
@@ -96,8 +96,8 @@ struct SettingsView: View {
                     Button("Done") { dismiss() }
                 }
             }
-            .sheet(item: $safariItem) { item in
-                SafariView(url: item.url)
+            .sheet(item: $safariPage) { page in
+                SafariView(url: page.url)
                     .ignoresSafeArea()
             }
             .onAppear {
@@ -112,26 +112,19 @@ struct SettingsView: View {
             || orgID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    private var safariItem: Binding<SignInPage?> {
-        Binding(
-            get: { safariURL.map(SignInPage.init) },
-            set: { if $0 == nil { safariURL = nil } }
-        )
-    }
-
     private func startSignIn() {
         let pkce = PKCE.make()
         verifier = pkce.verifier
         authURL = DevinAuth.signInURL(state: pkce.state, codeChallenge: pkce.challenge)
-        safariURL = authURL
+        safariPage = authURL.map(SignInPage.init)
         codeInput = ""
         signInStatus = nil
     }
 
     private func showSafari() {
         guard let url = authURL else { return }
-        safariURL = nil
-        DispatchQueue.main.async { safariURL = url }
+        safariPage = nil
+        DispatchQueue.main.async { safariPage = SignInPage(url: url) }
     }
 
     private func completeSignIn() async {
