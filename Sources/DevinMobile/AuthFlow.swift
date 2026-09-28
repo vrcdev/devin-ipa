@@ -63,6 +63,30 @@ enum DevinAuth {
         return token
     }
 
+    /// The CLI calls this Connect RPC right after login; the response carries
+    /// the user's org info. Returns the first org-… id found, if any.
+    static func discoverOrg(token: String) async throws -> String? {
+        var urlRequest = URLRequest(
+            url: URL(string: "https://api.devin.ai/exa.seat_management_pb.SeatManagementService/GetUserStatus")!
+        )
+        urlRequest.httpMethod = "POST"
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        urlRequest.setValue("1", forHTTPHeaderField: "connect-protocol-version")
+        urlRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        urlRequest.httpBody = Data("{}".utf8)
+
+        let (data, response) = try await URLSession.shared.data(for: urlRequest)
+        guard let http = response as? HTTPURLResponse else { return nil }
+        guard (200..<300).contains(http.statusCode) else {
+            let text = String(data: data, encoding: .utf8) ?? ""
+            throw APIError.http(status: http.statusCode, body: String(text.prefix(300)))
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: data) else { return nil }
+        var strings: [String] = []
+        collectStrings(object, into: &strings)
+        return strings.first { $0.hasPrefix("org-") }
+    }
+
     /// The exchange response shape isn't documented — pull the first plausible
     /// token string out of whatever JSON the server returns.
     private static func extractToken(from data: Data) -> String? {

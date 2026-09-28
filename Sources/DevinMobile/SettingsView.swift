@@ -139,14 +139,22 @@ struct SettingsView: View {
             token = newToken
 
             let probe = DevinAPIClient(token: newToken, orgID: "")
-            if let me = try? await probe.getSelf() {
+            var status = "Signed in"
+            do {
+                let me = try await probe.getSelf()
+                status = "Signed in as \(me.userName ?? me.principalType)"
                 if let discoveredOrg = me.orgId, !discoveredOrg.isEmpty {
                     orgID = discoveredOrg
                 }
-                signInStatus = "Signed in as \(me.userName ?? me.principalType) — tap Save"
-            } else {
-                signInStatus = "Signed in — tap Save"
+            } catch {
+                status = "Signed in — profile lookup failed: \(error.localizedDescription)"
             }
+            if orgID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if let discovered = try? await DevinAuth.discoverOrg(token: newToken), !discovered.isEmpty {
+                    orgID = discovered
+                }
+            }
+            signInStatus = status + (orgID.isEmpty ? " — enter org ID, tap Save" : " — tap Save")
             self.verifier = nil
             authURL = nil
             codeInput = ""
