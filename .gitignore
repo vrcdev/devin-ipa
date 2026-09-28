@@ -5,3 +5,4 @@ Payload/
 *.xcodeproj
 xcuserdata/
 .DS_Store
+__pycache__/
