@@ -63,7 +63,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Organization ID")
                 } footer: {
-                    Text("Filled automatically after sign-in. Otherwise find it under Settings → Organizations in the Devin web app.")
+                    Text("Must be YOUR org — shown at the top of Settings → Devin API in the Devin web app.")
                 }
 
                 if let testResult {
@@ -150,7 +150,9 @@ struct SettingsView: View {
                 status = "Signed in — profile lookup failed: \(error.localizedDescription)"
             }
             if orgID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                if let discovered = try? await DevinAuth.discoverOrg(token: newToken), !discovered.isEmpty {
+                if let discovered = try? await DevinAuth.listOrgs(token: newToken), !discovered.isEmpty {
+                    orgID = discovered
+                } else if let discovered = try? await DevinAuth.discoverOrg(token: newToken), !discovered.isEmpty {
                     orgID = discovered
                 }
             }
@@ -178,9 +180,11 @@ struct SettingsView: View {
             if let tokenOrg = me.orgId, !tokenOrg.isEmpty, !enteredOrg.isEmpty, tokenOrg != enteredOrg {
                 detail += " — token org \(tokenOrg) differs from entered org"
             }
-            if !orgID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if !enteredOrg.isEmpty {
                 _ = try await client.listSessions(first: 1)
                 detail += ", sessions OK"
+            } else if let discovered = try? await DevinAuth.listOrgs(token: token.trimmingCharacters(in: .whitespacesAndNewlines)), !discovered.isEmpty {
+                detail += " — your org is \(discovered)"
             }
             testResult = detail
         } catch {

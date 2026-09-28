@@ -87,6 +87,27 @@ enum DevinAuth {
         return strings.first { $0.hasPrefix("org-") }
     }
 
+    /// Account-scoped keys (enterprise PATs / service users) can list their
+    /// organizations — returns the first org-… id found, if any.
+    static func listOrgs(token: String) async throws -> String? {
+        var urlRequest = URLRequest(
+            url: URL(string: "https://api.devin.ai/v3/enterprise/organizations")!
+        )
+        urlRequest.httpMethod = "GET"
+        urlRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await URLSession.shared.data(for: urlRequest)
+        guard let http = response as? HTTPURLResponse else { return nil }
+        guard (200..<300).contains(http.statusCode) else {
+            let text = String(data: data, encoding: .utf8) ?? ""
+            throw APIError.http(status: http.statusCode, body: String(text.prefix(300)))
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: data) else { return nil }
+        var strings: [String] = []
+        collectStrings(object, into: &strings)
+        return strings.first { $0.hasPrefix("org-") }
+    }
+
     /// The exchange response shape isn't documented — pull the first plausible
     /// token string out of whatever JSON the server returns.
     private static func extractToken(from data: Data) -> String? {
