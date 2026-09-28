@@ -6,6 +6,8 @@ struct SettingsView: View {
 
     @State private var token = ""
     @State private var orgID = ""
+    @State private var bridgeURL = ""
+    @State private var bridgeToken = ""
     @State private var testResult: String?
     @State private var testing = false
 
@@ -66,6 +68,20 @@ struct SettingsView: View {
                     Text("Must be YOUR org — shown at the top of Settings → Devin API in the Devin web app.")
                 }
 
+                Section {
+                    TextField("http://100.x.y.z:8787", text: $bridgeURL)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.URL)
+                    SecureField("bridge token", text: $bridgeToken)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                } header: {
+                    Text("Local Bridge (optional)")
+                } footer: {
+                    Text("For sessions running in the Devin CLI on a computer: run bridge/devin_local_bridge.py there (reachable via Tailscale), then enter its URL and DEVIN_BRIDGE_TOKEN.")
+                }
+
                 if let testResult {
                     Section {
                         Text(testResult)
@@ -76,12 +92,12 @@ struct SettingsView: View {
                 Section {
                     Button("Save") {
                         appState.saveCredentials(token: token, orgID: orgID)
+                        appState.saveBridge(url: bridgeURL, token: bridgeToken)
                         Task {
                             await appState.refresh()
                             dismiss()
                         }
                     }
-                    .disabled(canSave)
 
                     Button(testing ? "Testing…" : "Test Connection") {
                         Task { await testConnection() }
@@ -103,13 +119,10 @@ struct SettingsView: View {
             .onAppear {
                 token = appState.token
                 orgID = appState.orgID
+                bridgeURL = appState.bridgeURL
+                bridgeToken = appState.bridgeToken
             }
         }
-    }
-
-    private var canSave: Bool {
-        token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            || orgID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func startSignIn() {

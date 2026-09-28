@@ -9,7 +9,9 @@ A native iOS client for [Devin](https://devin.ai), built in SwiftUI on the publi
 - Session detail: message history (auto-refreshes), send messages to a running session
 - Links out to the session in the web app and its pull request
 - Terminate a session
-- API token stored in the iOS Keychain
+- Browser sign-in (same PKCE flow as `devin auth login`) or paste a `cog_` API token
+- **Local tab**: list/read/message sessions running in the Devin CLI on your own computer, via `bridge/devin_local_bridge.py`
+- API token + bridge token stored in the iOS Keychain
 
 ## Setup
 
@@ -18,6 +20,23 @@ A native iOS client for [Devin](https://devin.ai), built in SwiftUI on the publi
 3. Pull to refresh the session list, tap **+** to start a session.
 
 A PAT carries your own permissions (anything you can do in the web app). A service-user key needs the `ViewOrgSessions` / `ManageOrgSessions` org permissions.
+
+## Local sessions (bridge)
+
+The **Local** tab shows sessions running in the Devin CLI on your computer (`devin`, `devin -p`, etc.). Local sessions never leave your machine, so the app reaches them through a small Python daemon — `bridge/devin_local_bridge.py` — that wraps `devin acp` (the CLI's Agent Client Protocol server) and serves a tiny HTTP API.
+
+On the computer that hosts the local sessions:
+
+```bash
+# devin CLI installed + `devin auth login` already done
+export DEVIN_BRIDGE_TOKEN="pick-a-long-random-string"
+export DEVIN_WORKSPACES="~/projects/foo:~/projects/bar"   # ':'-separated dirs; default = cwd
+python3 devin_local_bridge.py                            # listens on :8787
+```
+
+Reach it from the phone with [Tailscale](https://tailscale.com) (free, no port forwarding): install Tailscale on both the computer and the iPhone, then in the app go to **Settings → Local Bridge** and enter `http://<computer-tailnet-ip>:8787` plus the same token. Alternatively expose it via `cloudflared`/`ngrok` and use the resulting https URL.
+
+Caveats: a local session currently open in the Devin CLI/Desktop may refuse a second attachment until closed there; transcripts are relayed live while the bridge is running (they re-sync on next open).
 
 ## Building the .ipa (GitHub Actions)
 
