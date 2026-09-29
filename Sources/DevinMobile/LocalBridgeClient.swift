@@ -30,7 +30,8 @@ struct BridgeSession: Decodable, Identifiable, Hashable {
     let id: String
     let title: String?
     let status: String?
-    let updatedAt: String?
+    let updatedAt: Double?
+    let locked: Bool?
 }
 
 struct BridgeWorkspace: Decodable, Hashable {
@@ -50,6 +51,8 @@ struct BridgeMessage: Decodable, Identifiable, Hashable {
 
 struct BridgeTranscript: Decodable {
     let running: Bool
+    let locked: Bool?
+    let lockOurs: Bool?
     let messages: [BridgeMessage]
 }
 
@@ -101,9 +104,10 @@ final class LocalBridgeClient {
         return try JSONDecoder().decode(BridgeTranscript.self, from: data)
     }
 
-    func sendMessage(ws: Int, sessionID: String, text: String, apiKey: String? = nil) async throws {
+    func sendMessage(ws: Int, sessionID: String, text: String, apiKey: String? = nil, force: Bool = false) async throws {
         var body: [String: Any] = ["ws": ws, "id": sessionID, "text": text]
         if let apiKey, !apiKey.isEmpty { body["apiKey"] = apiKey }
+        if force { body["force"] = true }
         _ = try await request("POST", "/message", body: body)
     }
 

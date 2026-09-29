@@ -6,8 +6,26 @@ Multi-PC: run one bridge per computer, each with its own token (and ideally
 its own port). The app stores a list of PCs; every user keeps their own
 bridges/tokens, so one user's phone can never reach another user's PC.
 
+Architecture notes (reverse-engineered, devin 3000.x):
+  - Reads are lock-free: the CLI stores everything in cli/sessions.db
+    (SQLite WAL). We read message_nodes/tool_call_state/sessions directly —
+    live view even while a session is open in Devin Desktop or a terminal.
+  - Writes go through `devin acp` (JSON-RPC over stdio). One session = one
+    host process; cli/session_locks/<id>.lock holds the owner PID. Dead PIDs
+    are reclaimed automatically; a lock held by a live process 409s here.
+  - `session/prompt` requires authenticating the ACP host first via
+    authenticate {methodId: devin-browser, _meta.api_key}.
+  - `force` on /message kills a standalone `devin` process whose command
+    line names the session, then reclaims the lock. Desktop-hosted sessions
+    (devin.exe acp children of Devin.exe) are never killed — return 409 so
+    the app can tell the user to close the tab instead.
+  - The ACP host is killed ~60s after its last turn finishes so the bridge
+    never squats session locks.
+
 Setup on the PC that runs your local sessions:
-  1. devin CLI installed and authenticated (`devin auth login`)
+  1. devin CLI installed; sign in once via the Devin desktop app or
+     `devin auth login` (the bridge reuses windsurf_api_key from
+     credentials.toml, or set DEVIN_API_KEY)
   2. python3 devin_local_bridge.py  (Python 3.9+, stdlib only)
   3. Reach it from the phone over Tailscale (recommended) or a tunnel
 
@@ -22,17 +40,18 @@ Environment:
                          token is the only thing protecting it. Keep it
                          secret and only expose the bridge on a tailnet.
   DEVIN_API_KEY          Devin API key for ACP `authenticate`. Defaults to
-                         the windsurf_api_key in the Devin credentials.toml
-                         (populated by signing into the Devin desktop app or
-                         `devin auth login`). The app may also pass apiKey
-                         per request as a fallback.
+                         the windsurf_api_key in the Devin credentials.toml.
+                         The app may also pass apiKey per request.
+  DEVIN_SESSIONS_DB      override path to sessions.db.
 """
 
+import glob
 import json
 import os
 import queue
 import re
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -40,10 +59,11 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "2.0"
+VERSION = "3.0"
 PORT = int(os.environ.get("DEVIN_BRIDGE_PORT", "8787"))
 TOKEN = os.environ.get("DEVIN_BRIDGE_TOKEN", "")
 SHELL_ENABLED = os.environ.get("DEVIN_BRIDGE_NO_SHELL", "") != "1"
+IDLE_RELEASE_SECS = 60
 _sep = ";" if os.name == "nt" else ":"
 WORKSPACES = [
     os.path.abspath(os.path.expanduser(p))
@@ -51,6 +71,13 @@ WORKSPACES = [
     if p.strip()
 ] or [os.getcwd()]
 
+CLI_DIR_CANDIDATES = [
+    os.path.join(os.environ.get("APPDATA", ""), "devin", "cli"),
+    os.path.expanduser("~/.config/devin/cli"),
+    os.path.expanduser("~/.devin/cli"),
+    os.path.expanduser("~/.local/share/devin/cli"),
+    os.path.expanduser("~/Library/Application Support/devin/cli"),
+]
 CREDENTIALS_CANDIDATES = [
     os.path.join(os.environ.get("APPDATA", ""), "devin", "credentials.toml"),
     os.path.expanduser("~/.config/devin/credentials.toml"),
@@ -58,10 +85,27 @@ CREDENTIALS_CANDIDATES = [
 ]
 
 
+def log(*args):
+    print(f"[bridge {time.strftime('%H:%M:%S')}]", *args, file=sys.stderr, flush=True)
+
+
+def find_db():
+    if os.environ.get("DEVIN_SESSIONS_DB"):
+        return os.environ["DEVIN_SESSIONS_DB"]
+    for d in CLI_DIR_CANDIDATES:
+        p = os.path.join(d, "sessions.db")
+        if os.path.exists(p):
+            return p
+    return None
+
+
+DB_PATH = find_db()
+LOCKDIR = os.path.join(os.path.dirname(DB_PATH), "session_locks") if DB_PATH else None
+
+
 def find_api_key():
     """ACP mode refuses local CLI credentials, but `authenticate` accepts an
-    API key in _meta.api_key. Prefer env, else pull the key the Devin
-    desktop/CLI already stored."""
+    API key in _meta.api_key."""
     if os.environ.get("DEVIN_API_KEY"):
         return os.environ["DEVIN_API_KEY"].strip()
     for path in CREDENTIALS_CANDIDATES:
@@ -76,66 +120,205 @@ def find_api_key():
     return ""
 
 
-def log(*args):
-    print(f"[bridge {time.strftime('%H:%M:%S')}]", *args, file=sys.stderr, flush=True)
+# -------------------------------------------------------------- sqlite reads
+
+def _db():
+    return sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=5)
 
 
-# ---------------------------------------------------------------- transcripts
+def list_sessions_db():
+    """Session registry straight from SQLite — no ACP, no locks."""
+    if not DB_PATH:
+        return []
+    out = []
+    db = _db()
+    try:
+        rows = db.execute(
+            "SELECT id, working_directory, title, last_activity_at, workspace_dirs "
+            "FROM sessions WHERE COALESCE(hidden,0)=0 ORDER BY last_activity_at DESC"
+        ).fetchall()
+    finally:
+        db.close()
+    ws_lower = [w.lower() for w in WORKSPACES]
+    for sid, cwd, title, ts, wdirs in rows:
+        dirs = [cwd] if cwd else []
+        try:
+            dirs += json.loads(wdirs or "[]")
+        except (json.JSONDecodeError, TypeError):
+            pass
+        matched = []
+        for d in dirs:
+            dl = (d or "").lower()
+            for i, w in enumerate(ws_lower):
+                if dl == w or dl.startswith(w + os.sep):
+                    if i not in matched:
+                        matched.append(i)
+                    break
+        li = lock_info(sid)
+        out.append({
+            "id": sid,
+            "title": title,
+            "status": None,
+            "updatedAt": ts,
+            "locked": li["locked"],
+            "workspaces": matched,
+        })
+    return out
 
-class SessionBuffer:
-    """Ordered, de-duplicated transcript built from ACP session/update events."""
 
-    def __init__(self):
-        self.messages = []          # [{id, role, text, status}]
-        self._by_key = {}           # dedup key -> index into messages
-        self.running = False
-        self.lock = threading.Lock()
+def _content_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            b.get("text", "") for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return ""
 
-    def _append(self, key, role, text, status=None):
-        with self.lock:
-            if key in self._by_key:
-                m = self.messages[self._by_key[key]]
-                m["text"] += text
-                if status:
-                    m["status"] = status
-            else:
-                self._by_key[key] = len(self.messages)
-                self.messages.append(
-                    {"id": key, "role": role, "text": text, "status": status}
-                )
 
-    def apply(self, update):
-        kind = update.get("sessionUpdate", "")
-        mid = update.get("messageId") or update.get("toolCallId") or kind
-        if kind == "user_message_chunk":
-            self._append(f"user:{mid}", "user", update.get("content", {}).get("text", ""))
-        elif kind == "agent_message_chunk":
-            self._append(f"agent:{mid}", "agent", update.get("content", {}).get("text", ""))
-        elif kind == "agent_thought_chunk":
-            self._append(f"thought:{mid}", "thought", update.get("content", {}).get("text", ""))
-        elif kind == "tool_call":
-            title = update.get("title") or update.get("kind") or "tool call"
-            self._append(f"tool:{mid}", "tool", title, update.get("status"))
-        elif kind == "tool_call_update":
-            tid = update.get("toolCallId", mid)
-            status = update.get("status")
-            fields = update.get("fields") or {}
-            title = fields.get("title") or update.get("title") or ""
-            self._append(f"tool:{tid}", "tool", title, status)
-        elif kind == "plan":
-            entries = update.get("entries") or []
-            text = "\n".join(
-                f"{'[x]' if e.get('status') == 'completed' else '[ ]'} {e.get('content', '')}"
-                for e in entries
-            )
-            self._append(f"plan:{mid}", "plan", text)
+def read_transcript_db(sid):
+    """Full transcript from message_nodes + tool_call_state. Lock-free."""
+    db = _db()
+    try:
+        nodes = db.execute(
+            "SELECT node_id, chat_message FROM message_nodes "
+            "WHERE session_id=? ORDER BY node_id", (sid,)
+        ).fetchall()
+        tools = {}
+        for tid, tj, tu in db.execute(
+            "SELECT tool_call_id, tool_call_json, tool_call_update_json "
+            "FROM tool_call_state WHERE session_id=?", (sid,)
+        ):
+            try:
+                tools[tid] = (json.loads(tj or "{}"), json.loads(tu or "{}"))
+            except json.JSONDecodeError:
+                tools[tid] = ({}, {})
+        last_activity = db.execute(
+            "SELECT last_activity_at FROM sessions WHERE id=?", (sid,)
+        ).fetchone()
+    finally:
+        db.close()
 
-    def snapshot(self):
-        with self.lock:
-            return {
-                "running": self.running,
-                "messages": [dict(m) for m in self.messages],
-            }
+    msgs = []
+    for nid, raw in nodes:
+        try:
+            m = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        role = m.get("role")
+        text = _content_text(m.get("content"))
+        if role == "system":
+            continue
+        if role == "user":
+            if text.strip():
+                msgs.append({"id": f"n{nid}", "role": "user", "text": text, "status": None})
+        elif role == "assistant":
+            thinking = m.get("thinking")
+            if thinking:
+                if isinstance(thinking, str):
+                    ttext = thinking
+                elif isinstance(thinking, dict):
+                    ttext = thinking.get("thinking") or thinking.get("text") or ""
+                else:
+                    ttext = ""
+                if ttext.strip():
+                    msgs.append({"id": f"th{nid}", "role": "thought", "text": ttext, "status": None})
+            if text.strip():
+                msgs.append({"id": f"n{nid}", "role": "agent", "text": text, "status": None})
+        elif role == "tool":
+            tj, tu = tools.get(m.get("tool_call_id"), ({}, {}))
+            title = tj.get("title") or tj.get("kind") or "tool"
+            status = tu.get("status") or tj.get("status")
+            msgs.append({"id": f"to{nid}", "role": "tool", "text": title, "status": status})
+    return msgs, (last_activity[0] if last_activity else None)
+
+
+# ------------------------------------------------------------------ locks
+
+def pid_alive(pid):
+    if os.name == "nt":
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout
+            return str(pid) in out
+        except Exception:
+            return True  # can't tell -> assume alive, stay safe
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def lock_info(sid):
+    """{locked, pid}. Lock file content is the holder PID; while the holder
+    keeps it open (Windows share-lock) it may be unreadable => still locked."""
+    if not LOCKDIR:
+        return {"locked": False, "pid": None}
+    lf = os.path.join(LOCKDIR, sid + ".lock")
+    if not os.path.exists(lf):
+        return {"locked": False, "pid": None}
+    try:
+        pid = int(open(lf).read().strip() or "0")
+    except (OSError, ValueError):
+        return {"locked": True, "pid": None}
+    if pid and pid_alive(pid):
+        return {"locked": True, "pid": pid}
+    return {"locked": False, "pid": pid}
+
+
+def find_holder(sid):
+    """PIDs of STANDALONE devin processes whose command line names the session.
+    `devin acp` hosts are never returned — they're the Desktop's extension
+    backend; killing one would nuke every session in that window."""
+    pids = []
+    if os.name == "nt":
+        ps = ("Get-CimInstance Win32_Process -Filter \"name='devin.exe'\" "
+              "| Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress")
+        try:
+            raw = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps],
+                capture_output=True, text=True, timeout=30).stdout
+            procs = json.loads(raw) if raw.strip() else []
+            if isinstance(procs, dict):
+                procs = [procs]
+        except Exception:
+            procs = []
+        for p in procs:
+            cmd = p.get("CommandLine") or ""
+            if sid in cmd and " acp" not in cmd:
+                pids.append(p["ProcessId"])
+    else:
+        try:
+            out = subprocess.run(["ps", "-eo", "pid,args"],
+                                 capture_output=True, text=True, timeout=15).stdout
+            for line in out.splitlines()[1:]:
+                parts = line.strip().split(None, 1)
+                if len(parts) == 2 and sid in parts[1] and "devin" in parts[1] \
+                        and " acp" not in parts[1] and "bridge" not in parts[1]:
+                    pids.append(int(parts[0]))
+        except Exception:
+            pass
+    return pids
+
+
+def kill_holder(sid):
+    killed = []
+    for pid in find_holder(sid):
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+        else:
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                continue
+        killed.append(pid)
+    if killed:
+        log(f"takeover: killed holder(s) {killed} for {sid}")
+    return killed
 
 
 # ------------------------------------------------------------------ ACP client
@@ -145,26 +328,28 @@ class AcpError(Exception):
 
 
 class AcpClient:
-    """One `devin acp` subprocess per workspace, NDJSON JSON-RPC over stdio."""
+    """One `devin acp` subprocess per workspace, spawned on demand for writes
+    (session/new, prompt). Killed after a quiet period so it never squats
+    session locks — reads don't touch it at all."""
 
     def __init__(self, cwd):
         self.cwd = cwd
         self.proc = None
         self.authed = False
         self.next_id = 0
-        self.pending = {}        # request id -> queue.Queue
-        self.buffers = {}        # session id -> SessionBuffer
+        self.pending = {}          # request id -> queue.Queue
+        self.running = set()       # session ids with a live turn
+        self.attached = set()      # session ids this host holds the lock on
+        self.last_used = 0.0
         self.write_lock = threading.Lock()
         self.spawn_lock = threading.Lock()
-
-    # -- lifecycle ----------------------------------------------------------
 
     def ensure(self):
         with self.spawn_lock:
             if self.proc and self.proc.poll() is None:
                 return
             self.authed = False
-            self.buffers = {}
+            self.attached = set()
             self.pending = {}
             log(f"spawning devin acp in {self.cwd}")
             self.proc = subprocess.Popen(
@@ -176,6 +361,7 @@ class AcpClient:
                 text=True,
                 bufsize=1,
             )
+            self.next_id = 0
             threading.Thread(target=self._read_loop, daemon=True).start()
             self.request(
                 "initialize",
@@ -185,18 +371,15 @@ class AcpClient:
                         "fs": {"readTextFile": False, "writeTextFile": False},
                         "terminal": False,
                     },
-                    "clientInfo": {"name": "devin-local-bridge", "version": "1.0"},
+                    "clientInfo": {"name": "devin-local-bridge", "version": "3.0"},
                 },
                 timeout=30,
             )
             self.authenticate()
 
     def authenticate(self, api_key=None):
-        """ACP doesn't use local CLI creds — feed it an API key explicitly.
-        Verified shape: params._meta.api_key, methodId devin-browser."""
         key = api_key or find_api_key()
         if not key:
-            log("no API key found — set DEVIN_API_KEY or sign into Devin")
             raise AcpError(
                 "no Devin API key: set DEVIN_API_KEY on the bridge or send "
                 "apiKey in the request (the app forwards your cloud token)"
@@ -222,15 +405,6 @@ class AcpClient:
                 q = self.pending.pop(msg["id"], None)
                 if q:
                     q.put(msg)
-            elif msg.get("method") == "session/update":
-                params = msg.get("params") or {}
-                sid = params.get("sessionId")
-                if sid:
-                    self.buffers.setdefault(sid, SessionBuffer()).apply(
-                        params.get("update") or {}
-                    )
-
-    # -- rpc ----------------------------------------------------------------
 
     def request(self, method, params, timeout=None):
         with self.write_lock:
@@ -240,9 +414,7 @@ class AcpClient:
             self.pending[rid] = q
             try:
                 self.proc.stdin.write(
-                    json.dumps(
-                        {"jsonrpc": "2.0", "id": rid, "method": method, "params": params}
-                    )
+                    json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
                     + "\n"
                 )
                 self.proc.stdin.flush()
@@ -256,66 +428,33 @@ class AcpClient:
             raise AcpError(f"{method} timed out")
         if "error" in msg:
             err = msg["error"]
-            raise AcpError(err.get("message") if isinstance(err, dict) else str(err))
+            data = err.get("data") if isinstance(err, dict) else None
+            e = AcpError(err.get("message") if isinstance(err, dict) else str(err))
+            e.kind = (data or {}).get("cognition.ai/errorKind", "")
+            raise e
         return msg.get("result")
 
-    # -- sessions ------------------------------------------------------------
-
-    def list_sessions(self):
-        """devin list --format json (ACP session/list is an undocumented
-        extension; the CLI flag is stable)."""
-        out = subprocess.run(
-            ["devin", "list", "--format", "json"],
-            cwd=self.cwd,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if out.returncode != 0:
-            raise AcpError(out.stderr.strip() or "devin list failed")
-        try:
-            data = json.loads(out.stdout)
-        except json.JSONDecodeError:
-            raise AcpError(f"devin list returned non-JSON: {out.stdout[:200]}")
-        if isinstance(data, dict):
-            data = data.get("sessions", [])
-        sessions = []
-        for s in data:
-            if not isinstance(s, dict):
-                continue
-            sid = s.get("sessionId") or s.get("session_id") or s.get("id") or s.get("devinId")
-            if not sid:
-                continue
-            sessions.append(
-                {
-                    "id": sid,
-                    "title": s.get("title") or s.get("name"),
-                    "status": s.get("statusEnum") or s.get("status"),
-                    "updatedAt": s.get("updatedAt") or s.get("updated_at") or s.get("lastActivityAt"),
-                }
-            )
-        return sessions
-
     def load(self, sid):
-        """session/load replays history into the session's buffer, then returns."""
-        self.ensure()
         self.request(
             "session/load",
             {"sessionId": sid, "cwd": self.cwd, "mcpServers": []},
             timeout=180,
         )
+        self.attached.add(sid)
 
     def new_session(self):
-        self.ensure()
         result = self.request(
             "session/new", {"cwd": self.cwd, "mcpServers": []}, timeout=60
         )
         return result.get("sessionId") if isinstance(result, dict) else result
 
-    def prompt_async(self, sid, text):
-        """Fire a turn; stream lands in the buffer via session/update."""
-        buf = self.buffers.setdefault(sid, SessionBuffer())
-        buf.running = True
+    def prompt(self, sid, text):
+        """Attach, send the prompt, run the turn to completion, then release
+        the session lock once things go quiet."""
+        self.ensure()
+        self.load(sid)
+        self.running.add(sid)
+        self.last_used = time.time()
 
         def run():
             try:
@@ -324,20 +463,26 @@ class AcpClient:
                     {"sessionId": sid, "prompt": [{"type": "text", "text": text}]},
                     timeout=None,
                 )
-            except Exception as e:  # surface in transcript
-                buf._append(f"err:{time.time()}", "thought", f"[bridge] prompt failed: {e}")
+            except Exception as e:
+                log(f"prompt on {sid} failed: {e}")
             finally:
-                buf.running = False
+                self.running.discard(sid)
+                self.last_used = time.time()
+                threading.Timer(IDLE_RELEASE_SECS, self.release_if_idle).start()
 
         threading.Thread(target=run, daemon=True).start()
 
-    def transcript(self, sid, ensure_loaded=True):
-        if ensure_loaded and sid not in self.buffers:
-            self.load(sid)
-        return self.buffers.get(sid, SessionBuffer()).snapshot()
+    def release_if_idle(self):
+        if self.running or time.time() - self.last_used < IDLE_RELEASE_SECS - 5:
+            return
+        with self.spawn_lock:
+            if self.proc and self.proc.poll() is None:
+                log(f"idle release: killing acp in {self.cwd}, freeing {self.attached}")
+                self.proc.kill()
+            self.proc = None
+            self.authed = False
+            self.attached = set()
 
-
-# ------------------------------------------------------------------ http layer
 
 acps = {}
 acps_lock = threading.Lock()
@@ -360,6 +505,20 @@ def acp_for(ws_index):
     except (IndexError, ValueError):
         raise AcpError("unknown workspace index")
     return client_for_dir(ws)
+
+
+def running_sessions():
+    out = set()
+    for c in acps.values():
+        out |= c.running
+    return out
+
+
+def attached_sessions():
+    out = set()
+    for c in acps.values():
+        out |= c.attached
+    return out
 
 
 def run_shell(body):
@@ -409,6 +568,8 @@ def run_shell(body):
     return result
 
 
+# ------------------------------------------------------------------ http layer
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -446,21 +607,29 @@ class Handler(BaseHTTPRequestHandler):
                     "hostname": socket.gethostname(),
                     "shell": SHELL_ENABLED,
                     "workspaces": WORKSPACES,
+                    "db": DB_PATH is not None,
                 })
             elif path == "/sessions":
-                groups = []
-                for i, d in enumerate(WORKSPACES):
-                    try:
-                        sessions = acp_for(i).list_sessions()
-                    except Exception as e:
-                        sessions = []
-                        log(f"list failed in {d}: {e}")
-                    groups.append({"index": i, "dir": d, "sessions": sessions})
-                self._send(200, {"workspaces": groups})
+                groups = {i: {"index": i, "dir": d, "sessions": []}
+                          for i, d in enumerate(WORKSPACES)}
+                for s in list_sessions_db():
+                    for i in s.pop("workspaces"):
+                        groups[i]["sessions"].append(s)
+                self._send(200, {"workspaces": list(groups.values())})
             elif path == "/transcript":
-                ws = params.get("ws", ["0"])[0]
                 sid = params.get("id", [""])[0]
-                self._send(200, acp_for(ws).transcript(sid))
+                msgs, last_activity = read_transcript_db(sid)
+                li = lock_info(sid)
+                running = sid in running_sessions() or (
+                    li["locked"] and last_activity is not None
+                    and time.time() - last_activity < 30
+                )
+                self._send(200, {
+                    "running": running,
+                    "locked": li["locked"],
+                    "lockOurs": sid in attached_sessions(),
+                    "messages": msgs,
+                })
             else:
                 self._send(404, {"error": "not found"})
         except Exception as e:
@@ -488,25 +657,41 @@ class Handler(BaseHTTPRequestHandler):
                     client = acp_for(ws_index)
                 if body.get("apiKey") and not client.authed:
                     client.authenticate(body["apiKey"])
+                client.ensure()
                 sid = client.new_session()
                 if prompt:
-                    client.prompt_async(sid, prompt)
+                    client.prompt(sid, prompt)
                 self._send(200, {"sessionId": sid, "ws": ws_index})
             elif path == "/shell":
                 self._send(200, run_shell(body))
             elif path == "/message":
                 ws, sid, text = body.get("ws", 0), body.get("id", ""), body.get("text", "")
+                li = lock_info(sid)
+                if li["locked"] and sid not in attached_sessions():
+                    if body.get("force"):
+                        kill_holder(sid)
+                        time.sleep(1.5)
+                        li = lock_info(sid)
+                    if li["locked"]:
+                        self._send(409, {
+                            "error": "session is open in another process",
+                            "locked": True,
+                            "canTakeover": bool(find_holder(sid)),
+                        })
+                        return
                 client = acp_for(ws)
                 if body.get("apiKey") and not client.authed:
                     client.authenticate(body["apiKey"])
-                if sid not in client.buffers:
-                    client.load(sid)
-                client.prompt_async(sid, text)
+                client.prompt(sid, text)
                 self._send(200, {"ok": True})
             else:
                 self._send(404, {"error": "not found"})
         except Exception as e:
-            self._send(500, {"error": str(e)})
+            kind = getattr(e, "kind", "")
+            if kind == "session_locked":
+                self._send(409, {"error": str(e), "locked": True})
+            else:
+                self._send(500, {"error": str(e)})
 
     def log_message(self, fmt, *args):
         pass
@@ -515,9 +700,12 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     if not TOKEN:
         sys.exit("Set DEVIN_BRIDGE_TOKEN — the app sends it as a Bearer token.")
+    if not DB_PATH:
+        log("WARNING: sessions.db not found — set DEVIN_SESSIONS_DB")
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     log(f"bridge v{VERSION} on {socket.gethostname()}")
-    log(f"listening on 0.0.0.0:{PORT}, shell={'on' if SHELL_ENABLED else 'off'}, workspaces: {WORKSPACES}")
+    log(f"listening on 0.0.0.0:{PORT}, shell={'on' if SHELL_ENABLED else 'off'}, "
+        f"db={DB_PATH or 'MISSING'}, workspaces: {WORKSPACES}")
     server.serve_forever()
 
 

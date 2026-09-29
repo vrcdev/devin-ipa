@@ -72,6 +72,11 @@ struct LocalSessionsView: View {
                                             .foregroundStyle(.secondary)
                                     }
                                 }
+                                if session.locked == true {
+                                    Image(systemName: "lock.fill")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
                             }
                             .padding(.vertical, 4)
                         }
@@ -134,9 +139,23 @@ struct LocalSessionDetailView: View {
     @State private var sending = false
     @State private var errorText: String?
     @State private var pollTask: Task<Void, Never>?
+    @State private var showTakeover = false
 
     var body: some View {
         VStack(spacing: 0) {
+            if transcript?.locked == true && transcript?.lockOurs != true {
+                HStack(spacing: 8) {
+                    Image(systemName: "lock.fill")
+                        .font(.caption2)
+                    Text("Open on this PC — watching live. Sending takes it over.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(.vertical, 6)
+                .padding(.horizontal)
+                Divider()
+            }
             if transcript?.running == true {
                 HStack(spacing: 8) {
                     ProgressView()
@@ -168,6 +187,14 @@ struct LocalSessionDetailView: View {
             Button("OK", role: .cancel) { errorText = nil }
         } message: {
             Text(errorText ?? "")
+        }
+        .alert("Session open on PC", isPresented: $showTakeover) {
+            Button("Take Over & Send", role: .destructive) {
+                Task { await send(force: true) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This session is running in a terminal on the computer. Taking over kills that host — the conversation carries on here.")
         }
     }
 
@@ -235,14 +262,20 @@ struct LocalSessionDetailView: View {
         }
     }
 
-    private func send() async {
+    private func send(force: Bool = false) async {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, let client = appState.client(for: bridge) else { return }
         sending = true
         do {
-            try await client.sendMessage(ws: ws, sessionID: sessionID, text: text, apiKey: appState.token)
+            try await client.sendMessage(ws: ws, sessionID: sessionID, text: text, apiKey: appState.token, force: force)
             draft = ""
             await load()
+        } catch APIError.http(let status, let body) where status == 409 {
+            if body.contains("\"canTakeover\":true") || body.contains("\"canTakeover\": true") {
+                showTakeover = true
+            } else {
+                errorText = "Session is open on the PC — close it there (Devin tab or terminal) to send from here."
+            }
         } catch {
             errorText = error.localizedDescription
         }
