@@ -6,8 +6,6 @@ struct SettingsView: View {
 
     @State private var token = ""
     @State private var orgID = ""
-    @State private var bridgeURL = ""
-    @State private var bridgeToken = ""
     @State private var testResult: String?
     @State private var testing = false
 
@@ -69,17 +67,10 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    TextField("http://100.x.y.z:8787", text: $bridgeURL)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .keyboardType(.URL)
-                    SecureField("bridge token", text: $bridgeToken)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
                 } header: {
-                    Text("Local Bridge (optional)")
+                    Text("Local Bridges")
                 } footer: {
-                    Text("For sessions running in the Devin CLI on a computer: run bridge/devin_local_bridge.py there (reachable via Tailscale), then enter its URL and DEVIN_BRIDGE_TOKEN.")
+                    Text("PCs running devin_local_bridge.py are managed on the Local tab — tap + there to add each computer's URL and token.")
                 }
 
                 if let testResult {
@@ -92,7 +83,6 @@ struct SettingsView: View {
                 Section {
                     Button("Save") {
                         appState.saveCredentials(token: token, orgID: orgID)
-                        appState.saveBridge(url: bridgeURL, token: bridgeToken)
                         Task {
                             await appState.refresh()
                             dismiss()
@@ -119,8 +109,6 @@ struct SettingsView: View {
             .onAppear {
                 token = appState.token
                 orgID = appState.orgID
-                bridgeURL = appState.bridgeURL
-                bridgeToken = appState.bridgeToken
             }
         }
     }

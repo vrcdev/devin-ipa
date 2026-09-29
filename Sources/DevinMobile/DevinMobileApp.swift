@@ -9,7 +9,7 @@ struct DevinMobileApp: App {
             TabView {
                 SessionsListView()
                     .tabItem { Label("Cloud", systemImage: "cloud") }
-                LocalSessionsView()
+                BridgeListView()
                     .tabItem { Label("Local", systemImage: "desktopcomputer") }
             }
             .environmentObject(appState)

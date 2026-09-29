@@ -2,22 +2,31 @@
 """Devin local bridge: exposes `devin` CLI local sessions over HTTP
 so the DevinMobile iOS app can list, read, and message them from a phone.
 
+Multi-PC: run one bridge per computer, each with its own token (and ideally
+its own port). The app stores a list of PCs; every user keeps their own
+bridges/tokens, so one user's phone can never reach another user's PC.
+
 Setup on the PC that runs your local sessions:
   1. devin CLI installed and authenticated (`devin auth login`)
   2. python3 devin_local_bridge.py  (Python 3.9+, stdlib only)
   3. Reach it from the phone over Tailscale (recommended) or a tunnel
 
 Environment:
-  DEVIN_BRIDGE_TOKEN   shared secret the app must send as Bearer (required)
-  DEVIN_BRIDGE_PORT    listen port (default 8787)
-  DEVIN_WORKSPACES     directories whose sessions to expose, separated by the
-                       OS path separator (':' on macOS/Linux, ';' on Windows).
-                       Defaults to the directory the bridge was started in.
+  DEVIN_BRIDGE_TOKEN     shared secret the app must send as Bearer (required)
+  DEVIN_BRIDGE_PORT      listen port (default 8787)
+  DEVIN_WORKSPACES       directories whose sessions to expose, separated by the
+                         OS path separator (':' on macOS/Linux, ';' on Windows).
+                         Defaults to the directory the bridge was started in.
+  DEVIN_BRIDGE_NO_SHELL  set to 1 to disable the /shell endpoint entirely.
+                         /shell runs ARBITRARY commands as your user — the
+                         token is the only thing protecting it. Keep it
+                         secret and only expose the bridge on a tailnet.
 """
 
 import json
 import os
 import queue
+import socket
 import subprocess
 import sys
 import threading
@@ -25,8 +34,10 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+VERSION = "2.0"
 PORT = int(os.environ.get("DEVIN_BRIDGE_PORT", "8787"))
 TOKEN = os.environ.get("DEVIN_BRIDGE_TOKEN", "")
+SHELL_ENABLED = os.environ.get("DEVIN_BRIDGE_NO_SHELL", "") != "1"
 _sep = ";" if os.name == "nt" else ":"
 WORKSPACES = [
     os.path.abspath(os.path.expanduser(p))
@@ -279,6 +290,17 @@ class AcpClient:
 
 acps = {}
 acps_lock = threading.Lock()
+shell_cwds = {}  # shell key -> last cwd
+
+
+def client_for_dir(path):
+    ws = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isdir(ws):
+        raise AcpError(f"not a directory: {ws}")
+    with acps_lock:
+        if ws not in acps:
+            acps[ws] = AcpClient(ws)
+        return acps[ws]
 
 
 def acp_for(ws_index):
@@ -286,10 +308,54 @@ def acp_for(ws_index):
         ws = WORKSPACES[int(ws_index)]
     except (IndexError, ValueError):
         raise AcpError("unknown workspace index")
-    with acps_lock:
-        if ws not in acps:
-            acps[ws] = AcpClient(ws)
-        return acps[ws]
+    return client_for_dir(ws)
+
+
+def run_shell(body):
+    """Execute a command; `cd` persists per shell key so the phone gets a
+    stateful-feeling terminal."""
+    if not SHELL_ENABLED:
+        raise AcpError("shell disabled (DEVIN_BRIDGE_NO_SHELL=1)")
+    command = (body.get("command") or "").strip()
+    if not command:
+        raise AcpError("empty command")
+    key = str(body.get("key") or "main")
+
+    cwd = body.get("cwd")
+    if cwd:
+        cwd = os.path.abspath(os.path.expanduser(cwd))
+    else:
+        cwd = shell_cwds.get(key)
+    if not cwd or not os.path.isdir(cwd):
+        try:
+            cwd = WORKSPACES[int(body.get("ws", 0))]
+        except (IndexError, ValueError):
+            cwd = WORKSPACES[0]
+
+    parts = command.split()
+    if parts and parts[0].lower() == "cd":
+        args = [p for p in parts[1:] if p.lower() != "/d"]
+        target = args[0] if args else os.path.expanduser("~")
+        target = target.strip('"\'')
+        new = os.path.abspath(os.path.join(cwd, os.path.expanduser(target)))
+        if not os.path.isdir(new):
+            return {"stdout": "", "stderr": f"cd: no such directory: {target}",
+                    "exitCode": 1, "cwd": cwd}
+        shell_cwds[key] = new
+        return {"stdout": "", "stderr": "", "exitCode": 0, "cwd": new}
+
+    try:
+        out = subprocess.run(
+            command, shell=True, cwd=cwd,
+            capture_output=True, text=True, timeout=300,
+        )
+        result = {"stdout": out.stdout, "stderr": out.stderr,
+                  "exitCode": out.returncode, "cwd": cwd}
+    except subprocess.TimeoutExpired:
+        result = {"stdout": "", "stderr": "command timed out (300s)",
+                  "exitCode": 124, "cwd": cwd}
+    shell_cwds[key] = cwd
+    return result
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -323,7 +389,13 @@ class Handler(BaseHTTPRequestHandler):
         params = parse_qs(urlparse(self.path).query)
         try:
             if path == "/health":
-                self._send(200, {"ok": True, "workspaces": WORKSPACES})
+                self._send(200, {
+                    "ok": True,
+                    "version": VERSION,
+                    "hostname": socket.gethostname(),
+                    "shell": SHELL_ENABLED,
+                    "workspaces": WORKSPACES,
+                })
             elif path == "/sessions":
                 groups = []
                 for i, d in enumerate(WORKSPACES):
@@ -350,12 +422,25 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = self._body()
             if path == "/session":
-                ws, prompt = body.get("ws", 0), body.get("prompt", "")
-                client = acp_for(ws)
+                prompt = body.get("prompt", "")
+                if body.get("dir"):
+                    ws_path = os.path.abspath(os.path.expanduser(body["dir"]))
+                    if not os.path.isdir(ws_path):
+                        raise AcpError(f"not a directory: {ws_path}")
+                    with acps_lock:
+                        if ws_path not in WORKSPACES:
+                            WORKSPACES.append(ws_path)
+                    client = client_for_dir(ws_path)
+                    ws_index = WORKSPACES.index(ws_path)
+                else:
+                    ws_index = int(body.get("ws", 0))
+                    client = acp_for(ws_index)
                 sid = client.new_session()
                 if prompt:
                     client.prompt_async(sid, prompt)
-                self._send(200, {"sessionId": sid})
+                self._send(200, {"sessionId": sid, "ws": ws_index})
+            elif path == "/shell":
+                self._send(200, run_shell(body))
             elif path == "/message":
                 ws, sid, text = body.get("ws", 0), body.get("id", ""), body.get("text", "")
                 client = acp_for(ws)
@@ -376,7 +461,8 @@ def main():
     if not TOKEN:
         sys.exit("Set DEVIN_BRIDGE_TOKEN — the app sends it as a Bearer token.")
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    log(f"listening on 0.0.0.0:{PORT}, workspaces: {WORKSPACES}")
+    log(f"bridge v{VERSION} on {socket.gethostname()}")
+    log(f"listening on 0.0.0.0:{PORT}, shell={'on' if SHELL_ENABLED else 'off'}, workspaces: {WORKSPACES}")
     server.serve_forever()
 
 

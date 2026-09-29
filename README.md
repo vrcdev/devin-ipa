@@ -10,8 +10,10 @@ A native iOS client for [Devin](https://devin.ai), built in SwiftUI on the publi
 - Links out to the session in the web app and its pull request
 - Terminate a session
 - Browser sign-in (same PKCE flow as `devin auth login`) or paste a `cog_` API token
-- **Local tab**: list/read/message sessions running in the Devin CLI on your own computer, via `bridge/devin_local_bridge.py`
-- API token + bridge token stored in the iOS Keychain
+- **Local tab**: a list of *PCs* running `bridge/devin_local_bridge.py` — each shows its own local CLI sessions, with live status from `/health`
+- Per-PC: session list grouped by workspace, new sessions (pick a workspace or type any path on that PC), message a running session, and a remote terminal (`cd` persists per PC)
+- Multiple users stay private by construction — everyone runs their own bridges on their own tailnet with their own tokens; the app is just a client
+- API token + every bridge token stored in the iOS Keychain
 
 ## Setup
 
@@ -23,20 +25,27 @@ A PAT carries your own permissions (anything you can do in the web app). A servi
 
 ## Local sessions (bridge)
 
-The **Local** tab shows sessions running in the Devin CLI on your computer (`devin`, `devin -p`, etc.). Local sessions never leave your machine, so the app reaches them through a small Python daemon — `bridge/devin_local_bridge.py` — that wraps `devin acp` (the CLI's Agent Client Protocol server) and serves a tiny HTTP API.
+The **Local** tab is a list of computers, each running `bridge/devin_local_bridge.py` — a small Python daemon that wraps `devin acp` (the CLI's Agent Client Protocol server) and serves a tiny HTTP API. Local sessions never leave the machine; the bridge is how the phone reaches them.
 
-On the computer that hosts the local sessions:
+On **each** computer that hosts local sessions:
 
 ```bash
 # devin CLI installed + `devin auth login` already done
-export DEVIN_BRIDGE_TOKEN="pick-a-long-random-string"
-export DEVIN_WORKSPACES="~/projects/foo:~/projects/bar"   # ':'-separated dirs; default = cwd
+export DEVIN_BRIDGE_TOKEN="pick-a-long-random-string"   # unique per PC is fine
+export DEVIN_WORKSPACES="~/projects/foo:~/projects/bar" # ':'-separated dirs; default = cwd
 python3 devin_local_bridge.py                            # listens on :8787
+# Windows: use `set`/`$env:` and ';'-separated DEVIN_WORKSPACES
 ```
 
-Reach it from the phone with [Tailscale](https://tailscale.com) (free, no port forwarding): install Tailscale on both the computer and the iPhone, then in the app go to **Settings → Local Bridge** and enter `http://<computer-tailnet-ip>:8787` plus the same token. Alternatively expose it via `cloudflared`/`ngrok` and use the resulting https URL.
+Reach each PC from the phone with [Tailscale](https://tailscale.com) (free, no port forwarding): install Tailscale on every computer and the iPhone, then in the app go to the **Local** tab → **+** and add each PC as `http://<pc-tailnet-ip>:8787` + its token. Alternatively expose a bridge via `cloudflared`/`ngrok` and use the resulting https URL.
 
-Caveats: a local session currently open in the Devin CLI/Desktop may refuse a second attachment until closed there; transcripts are relayed live while the bridge is running (they re-sync on next open).
+Bridge endpoints: `GET /health` (hostname/version/workspace info — powers the PC list), `GET /sessions`, `GET /transcript?ws=&id=`, `POST /session` (`{ws}` or `{dir}` + `prompt`), `POST /message`, `POST /shell` (`{key, command}` — arbitrary commands, `cd` tracked per key). All require `Authorization: Bearer <DEVIN_BRIDGE_TOKEN>`.
+
+**Security:** `/shell` runs arbitrary commands as your user. The token is the only protection — keep bridges on a tailnet, give each PC a strong unique token, and set `DEVIN_BRIDGE_NO_SHELL=1` on machines that should be sessions-only.
+
+**Sharing with a friend:** everyone runs their own bridges + tokens on their own tailnet (or ACL'd devices on a shared tailnet). There is no shared server — your phone can't reach their PCs and theirs can't reach yours. Each person just configures the same app differently.
+
+Caveats: a local session currently open in the Devin CLI/Desktop may refuse a second attachment until closed there; transcripts are relayed live while the bridge is running (they re-sync on next open); the terminal captures command output rather than streaming a live TTY.
 
 ## Building the .ipa (GitHub Actions)
 

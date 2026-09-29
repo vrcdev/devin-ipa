@@ -1,65 +1,56 @@
 import SwiftUI
 
 struct LocalSessionsView: View {
+    let bridge: BridgeConfig
+
     @EnvironmentObject var appState: AppState
     @State private var workspaces: [BridgeWorkspace] = []
     @State private var loading = false
     @State private var errorText: String?
     @State private var showNewSession = false
-    @State private var showSettings = false
 
     var body: some View {
-        NavigationStack {
-            Group {
-                if !appState.hasBridge {
-                    missingBridgeView
-                } else if workspaces.isEmpty && loading {
-                    ProgressView("Loading local sessions…")
-                } else if workspaces.isEmpty {
-                    emptyView
-                } else {
-                    sessionList
-                }
+        Group {
+            if workspaces.isEmpty && loading {
+                ProgressView("Loading local sessions…")
+            } else if workspaces.isEmpty {
+                emptyView
+            } else {
+                sessionList
             }
-            .navigationTitle("Local")
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button { showSettings = true } label: {
-                        Image(systemName: "gear")
+        }
+        .navigationTitle(bridge.displayName)
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                HStack(spacing: 16) {
+                    NavigationLink {
+                        ShellView(bridge: bridge).environmentObject(appState)
+                    } label: {
+                        Image(systemName: "terminal")
                     }
-                }
-                ToolbarItem(placement: .navigationBarTrailing) {
                     Button { showNewSession = true } label: {
                         Image(systemName: "plus")
                     }
-                    .disabled(!appState.hasBridge)
                 }
             }
-            .task { await refresh() }
-            .navigationDestination(for: LocalRoute.self) { route in
-                LocalSessionDetailView(ws: route.ws, sessionID: route.id, title: route.title)
-                    .environmentObject(appState)
+        }
+        .task { await refresh() }
+        .sheet(isPresented: $showNewSession) {
+            NewLocalSessionView(bridge: bridge, workspaces: workspaces) {
+                await refresh()
             }
-            .sheet(isPresented: $showSettings) {
-                SettingsView().environmentObject(appState)
-            }
-            .sheet(isPresented: $showNewSession) {
-                NewLocalSessionView(workspaces: workspaces) {
-                    await refresh()
-                }
-                .environmentObject(appState)
-            }
-            .alert(
-                "Something went wrong",
-                isPresented: Binding(
-                    get: { errorText != nil },
-                    set: { if !$0 { errorText = nil } }
-                )
-            ) {
-                Button("OK", role: .cancel) { errorText = nil }
-            } message: {
-                Text(errorText ?? "")
-            }
+            .environmentObject(appState)
+        }
+        .alert(
+            "Something went wrong",
+            isPresented: Binding(
+                get: { errorText != nil },
+                set: { if !$0 { errorText = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) { errorText = nil }
+        } message: {
+            Text(errorText ?? "")
         }
     }
 
@@ -68,7 +59,7 @@ struct LocalSessionsView: View {
             ForEach(workspaces, id: \.index) { ws in
                 Section(header: Text(ws.dir).font(.caption)) {
                     ForEach(ws.sessions) { session in
-                        NavigationLink(value: LocalRoute(ws: ws.index, id: session.id, title: session.title)) {
+                        NavigationLink(value: LocalRoute(bridge: bridge, ws: ws.index, id: session.id, title: session.title)) {
                             HStack(spacing: 12) {
                                 StatusDot(status: session.status ?? "")
                                 VStack(alignment: .leading, spacing: 4) {
@@ -91,22 +82,6 @@ struct LocalSessionsView: View {
         .refreshable { await refresh() }
     }
 
-    private var missingBridgeView: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "desktopcomputer")
-                .font(.system(size: 44))
-                .foregroundStyle(.secondary)
-            Text("No local bridge configured")
-                .font(.title3.bold())
-            Text("Run devin_local_bridge.py on the PC hosting your local sessions, then enter its URL and token in Settings.")
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-            Button("Open Settings") { showSettings = true }
-                .buttonStyle(.borderedProminent)
-        }
-        .padding()
-    }
-
     private var emptyView: some View {
         VStack(spacing: 16) {
             Image(systemName: "tray")
@@ -127,7 +102,7 @@ struct LocalSessionsView: View {
     }
 
     private func refresh() async {
-        guard let client = appState.bridgeClient else { return }
+        guard let client = appState.client(for: bridge) else { return }
         loading = workspaces.isEmpty
         do {
             workspaces = try await client.listWorkspaces()
@@ -140,12 +115,14 @@ struct LocalSessionsView: View {
 }
 
 struct LocalRoute: Hashable {
+    let bridge: BridgeConfig
     let ws: Int
     let id: String
     let title: String?
 }
 
 struct LocalSessionDetailView: View {
+    let bridge: BridgeConfig
     let ws: Int
     let sessionID: String
     let title: String?
@@ -239,7 +216,7 @@ struct LocalSessionDetailView: View {
     }
 
     private func load() async {
-        guard let client = appState.bridgeClient else { return }
+        guard let client = appState.client(for: bridge) else { return }
         do {
             transcript = try await client.transcript(ws: ws, sessionID: sessionID)
         } catch {
@@ -260,7 +237,7 @@ struct LocalSessionDetailView: View {
 
     private func send() async {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, let client = appState.bridgeClient else { return }
+        guard !text.isEmpty, let client = appState.client(for: bridge) else { return }
         sending = true
         do {
             try await client.sendMessage(ws: ws, sessionID: sessionID, text: text)
@@ -324,6 +301,7 @@ struct LocalMessageRow: View {
 }
 
 struct NewLocalSessionView: View {
+    let bridge: BridgeConfig
     let workspaces: [BridgeWorkspace]
     var onCreated: () async -> Void
 
@@ -332,6 +310,7 @@ struct NewLocalSessionView: View {
 
     @State private var prompt = ""
     @State private var wsIndex = 0
+    @State private var customDir = ""
     @State private var creating = false
     @State private var errorText: String?
 
@@ -342,12 +321,20 @@ struct NewLocalSessionView: View {
                     TextEditor(text: $prompt)
                         .frame(minHeight: 140)
                 }
-                Section("Workspace") {
+                Section {
                     Picker("Directory", selection: $wsIndex) {
                         ForEach(workspaces, id: \.index) { ws in
                             Text(ws.dir).tag(ws.index)
                         }
                     }
+                    .disabled(!customDir.isEmpty)
+                    TextField("Or a custom path on that PC…", text: $customDir)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                } header: {
+                    Text("Workspace")
+                } footer: {
+                    Text("A custom path is added to the bridge's workspace list for next time.")
                 }
             }
             .navigationTitle("New Local Session")
@@ -384,11 +371,13 @@ struct NewLocalSessionView: View {
     }
 
     private func create() async {
-        guard let client = appState.bridgeClient else { return }
+        guard let client = appState.client(for: bridge) else { return }
         creating = true
         do {
+            let dir = customDir.trimmingCharacters(in: .whitespacesAndNewlines)
             _ = try await client.newSession(
-                ws: wsIndex,
+                ws: dir.isEmpty ? wsIndex : nil,
+                dir: dir.isEmpty ? nil : dir,
                 prompt: prompt.trimmingCharacters(in: .whitespacesAndNewlines)
             )
             await onCreated()

@@ -1,5 +1,31 @@
 import Foundation
 
+/// One PC running `devin_local_bridge.py`. Persisted in UserDefaults;
+/// the bearer token lives in the Keychain under `devin_bridge_token_<id>`.
+struct BridgeConfig: Codable, Identifiable, Hashable {
+    let id: String
+    var name: String
+    var url: String
+
+    init(id: String = UUID().uuidString, name: String, url: String) {
+        self.id = id
+        self.name = name
+        self.url = url
+    }
+
+    var displayName: String {
+        name.isEmpty ? (URL(string: url)?.host ?? url) : name
+    }
+}
+
+struct BridgeHealth: Decodable {
+    let ok: Bool
+    let version: String?
+    let hostname: String?
+    let shell: Bool?
+    let workspaces: [String]?
+}
+
 struct BridgeSession: Decodable, Identifiable, Hashable {
     let id: String
     let title: String?
@@ -27,15 +53,23 @@ struct BridgeTranscript: Decodable {
     let messages: [BridgeMessage]
 }
 
+struct BridgeShellResult: Decodable {
+    let stdout: String
+    let stderr: String
+    let exitCode: Int
+    let cwd: String
+}
+
 private struct BridgeSessionsResponse: Decodable {
     let workspaces: [BridgeWorkspace]
 }
 
 private struct BridgeNewSessionResponse: Decodable {
     let sessionId: String
+    let ws: Int?
 }
 
-/// Talks to `bridge/devin_local_bridge.py` running on the user's PC.
+/// Talks to `bridge/devin_local_bridge.py` running on one PC.
 final class LocalBridgeClient {
     private let base: URL
     private let token: String
@@ -45,6 +79,11 @@ final class LocalBridgeClient {
         guard let url = URL(string: trimmed), url.scheme != nil else { return nil }
         self.base = url
         self.token = token.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func health() async throws -> BridgeHealth {
+        let data = try await request("GET", "/health", timeout: 15)
+        return try JSONDecoder().decode(BridgeHealth.self, from: data)
     }
 
     func listWorkspaces() async throws -> [BridgeWorkspace] {
@@ -66,20 +105,31 @@ final class LocalBridgeClient {
         _ = try await request("POST", "/message", body: ["ws": ws, "id": sessionID, "text": text])
     }
 
-    func newSession(ws: Int, prompt: String) async throws -> String {
-        let data = try await request("POST", "/session", body: ["ws": ws, "prompt": prompt])
-        return try JSONDecoder().decode(BridgeNewSessionResponse.self, from: data).sessionId
+    /// Creates a session; pass a workspace index OR a raw directory path.
+    /// Returns (sessionId, wsIndex) — custom dirs join the bridge's workspace list.
+    func newSession(ws: Int? = nil, dir: String? = nil, prompt: String) async throws -> (sessionId: String, ws: Int) {
+        var body: [String: Any] = ["prompt": prompt]
+        if let ws { body["ws"] = ws }
+        if let dir { body["dir"] = dir }
+        let data = try await request("POST", "/session", body: body)
+        let res = try JSONDecoder().decode(BridgeNewSessionResponse.self, from: data)
+        return (res.sessionId, res.ws ?? ws ?? 0)
     }
 
-    private func request(_ method: String, _ path: String, body: [String: Any]? = nil) async throws -> Data {
-        try await request(method, base.appendingPathComponent(path), body: body)
+    func runShell(key: String, command: String) async throws -> BridgeShellResult {
+        let data = try await request("POST", "/shell", body: ["key": key, "command": command])
+        return try JSONDecoder().decode(BridgeShellResult.self, from: data)
     }
 
-    private func request(_ method: String, _ url: URL, body: [String: Any]? = nil) async throws -> Data {
+    private func request(_ method: String, _ path: String, body: [String: Any]? = nil, timeout: TimeInterval = 120) async throws -> Data {
+        try await request(method, base.appendingPathComponent(path), body: body, timeout: timeout)
+    }
+
+    private func request(_ method: String, _ url: URL, body: [String: Any]? = nil, timeout: TimeInterval = 120) async throws -> Data {
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = method
         urlRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        urlRequest.timeoutInterval = 120
+        urlRequest.timeoutInterval = timeout
         if let body {
             urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
             urlRequest.httpBody = try JSONSerialization.data(withJSONObject: body)
