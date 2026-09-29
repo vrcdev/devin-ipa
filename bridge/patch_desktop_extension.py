@@ -23,16 +23,20 @@ MARKER = "devin-local-bridge inject patch"
 
 SESSION_HOOKS = [
     (
+        "initialize(A){return this.connection.sendRequest(wS,A)}",
+        "initialize(A){try{globalThis.__devinConn=this.connection;(globalThis.__devinConnSet=globalThis.__devinConnSet||[]).indexOf(this.connection)<0&&globalThis.__devinConnSet.push(this.connection)}catch(__e){}return this.connection.sendRequest(wS,A)}",
+    ),
+    (
         "loadSession(A){return this.connection.sendRequest(SS,A,uP)",
-        "loadSession(A){try{globalThis.__devinConn=this.connection;(globalThis.__devinConns=globalThis.__devinConns||{})[A&&A.sessionId]=this.connection}catch(__e){}return this.connection.sendRequest(SS,A,uP)",
+        "loadSession(A){try{globalThis.__devinConn=this.connection;(globalThis.__devinConns=globalThis.__devinConns||{})[A&&A.sessionId]=this.connection;(globalThis.__devinConnSet=globalThis.__devinConnSet||[]).indexOf(this.connection)<0&&globalThis.__devinConnSet.push(this.connection)}catch(__e){}return this.connection.sendRequest(SS,A,uP)",
     ),
     (
         "resumeSession(A){return this.connection.sendRequest(JS,A)",
-        "resumeSession(A){try{globalThis.__devinConn=this.connection;(globalThis.__devinConns=globalThis.__devinConns||{})[A&&A.sessionId]=this.connection}catch(__e){}return this.connection.sendRequest(JS,A)",
+        "resumeSession(A){try{globalThis.__devinConn=this.connection;(globalThis.__devinConns=globalThis.__devinConns||{})[A&&A.sessionId]=this.connection;(globalThis.__devinConnSet=globalThis.__devinConnSet||[]).indexOf(this.connection)<0&&globalThis.__devinConnSet.push(this.connection)}catch(__e){}return this.connection.sendRequest(JS,A)",
     ),
     (
         "newSession(A){return this.connection.sendRequest(MS,A)",
-        "newSession(A){try{globalThis.__devinConn=this.connection}catch(__e){}return this.connection.sendRequest(MS,A)",
+        "newSession(A){try{globalThis.__devinConn=this.connection;(globalThis.__devinConnSet=globalThis.__devinConnSet||[]).indexOf(this.connection)<0&&globalThis.__devinConnSet.push(this.connection)}catch(__e){}return this.connection.sendRequest(MS,A)",
     ),
 ]
 
@@ -65,10 +69,29 @@ SERVER_SNIPPET = r'''
         req.on("end", async () => {
           try {
             const {sessionId, text} = JSON.parse(body || "{}");
-            const conn = (globalThis.__devinConns||{})[sessionId] || globalThis.__devinConn;
-            if (!conn) return done(409, {error: "no session has been opened in this window yet"});
-            conn.sendRequest("session/prompt", {sessionId, prompt: [{type: "text", text}]}).catch(() => {});
-            done(200, {ok: true});
+            const seen = new Set();
+            const cands = [];
+            for (const c of [(globalThis.__devinConns||{})[sessionId], globalThis.__devinConn, ...(globalThis.__devinConnSet||[])]) {
+              if (c && !seen.has(c)) { seen.add(c); cands.push(c); }
+            }
+            if (!cands.length) return done(409, {error: "no ACP connection in this window yet"});
+            const params = {sessionId, prompt: [{type: "text", text}]};
+            let lastErr = "no ACP connection accepted the prompt";
+            for (const conn of cands) {
+              try {
+                const r = conn.sendRequest("session/prompt", params);
+                const settled = await Promise.race([
+                  r.then(() => "ok").catch(e => String(e && e.message || e)),
+                  new Promise(res => setTimeout(() => res("pending"), 2500)),
+                ]);
+                if (settled === "ok" || settled === "pending") {
+                  r.catch(() => {});
+                  return done(200, {ok: true});
+                }
+                lastErr = settled;
+              } catch (e) { lastErr = String(e && e.message || e); }
+            }
+            done(409, {error: lastErr});
           } catch (e) { done(400, {error: String(e && e.message || e)}); }
         });
       });
@@ -77,11 +100,11 @@ SERVER_SNIPPET = r'''
         try {
           const port = srv.address().port;
           for (const dir of cliDirs) {
-            try { fs.mkdirSync(dir, {recursive: true}); fs.writeFileSync(path.join(dir, "desktop_inject.port"), `${port} ${secret}`); } catch (e) {}
+            try { fs.mkdirSync(dir, {recursive: true}); fs.writeFileSync(path.join(dir, `desktop_inject.${process.pid}.port`), `${port} ${secret}`); fs.writeFileSync(path.join(dir, "desktop_inject.port"), `${port} ${secret}`); } catch (e) {}
           }
         } catch (e) {}
       });
-      process.on("exit", () => { try { srv.close(); } catch (e) {} });
+      process.on("exit", () => { try { srv.close(); } catch (e) {} for (const dir of cliDirs) { try { fs.unlinkSync(path.join(dir, `desktop_inject.${process.pid}.port`)); } catch (e) {} } });
     } catch (e) {}
     return r;
   };

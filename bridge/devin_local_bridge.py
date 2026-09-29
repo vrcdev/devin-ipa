@@ -324,48 +324,49 @@ def kill_holder(sid):
 # ------------------------------------------------- desktop inject (patched app)
 
 def desktop_inject_info():
-    """Read the port+secret the patched Devin Desktop extension writes.
-    Returns (port, secret) or None if the inject server isn't running."""
+    """(port, secret) pairs for every patched Devin Desktop window — each
+    extension host writes its own desktop_inject.<pid>.port file. Empty list
+    if the inject server isn't running anywhere."""
     import glob as _g
+    out = []
     for cli_dir in CLI_DIR_CANDIDATES:
-        f = os.path.join(cli_dir, "desktop_inject.port")
-        try:
-            port, secret = open(f).read().strip().split()
-            return int(port), secret
-        except (OSError, ValueError):
-            continue
-    return None
+        for f in _g.glob(os.path.join(cli_dir, "desktop_inject*.port")):
+            try:
+                port, secret = open(f).read().strip().split()
+                out.append((int(port), secret))
+            except (OSError, ValueError):
+                continue
+    return out
 
 
 def desktop_inject(sid, text, timeout=10):
     """Push a prompt through Devin Desktop's own ACP connection (requires the
     patched windsurf extension.js). The Desktop stays the lock holder — the
     message is delivered by its own plumbing, so this works on sessions that
-    are 'open in another process' with zero takeover. Returns (ok, detail)."""
-    info = desktop_inject_info()
-    if not info:
+    are 'open in another process' with zero takeover. Tries every window's
+    inject server until one accepts. Returns (ok, detail)."""
+    infos = desktop_inject_info()
+    if not infos:
         return False, "desktop inject server not found (patched app not running?)"
-    port, secret = info
     import http.client
-    try:
-        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
-        conn.request(
-            "POST", "/prompt",
-            body=json.dumps({"sessionId": sid, "text": text}),
-            headers={"Content-Type": "application/json", "X-Devin-Inject": secret},
-        )
-        resp = conn.getresponse()
-        data = json.loads(resp.read() or b"{}")
-        if resp.status == 200 and data.get("ok"):
-            return True, "injected via Devin Desktop"
-        return False, data.get("error") or f"inject http {resp.status}"
-    except (OSError, json.JSONDecodeError) as e:
-        return False, f"inject unreachable: {e}"
-    finally:
+    errors = []
+    for port, secret in infos:
         try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+            conn.request(
+                "POST", "/prompt",
+                body=json.dumps({"sessionId": sid, "text": text}),
+                headers={"Content-Type": "application/json", "X-Devin-Inject": secret},
+            )
+            resp = conn.getresponse()
+            data = json.loads(resp.read() or b"{}")
             conn.close()
-        except Exception:
-            pass
+            if resp.status == 200 and data.get("ok"):
+                return True, "injected via Devin Desktop"
+            errors.append(data.get("error") or f"inject http {resp.status}")
+        except (OSError, json.JSONDecodeError) as e:
+            errors.append(f"inject unreachable: {e}")
+    return False, "; ".join(errors) or "inject failed"
 
 
 # ------------------------------------------------------------------ ACP client
@@ -655,7 +656,7 @@ class Handler(BaseHTTPRequestHandler):
                     "shell": SHELL_ENABLED,
                     "workspaces": WORKSPACES,
                     "db": DB_PATH is not None,
-                    "inject": desktop_inject_info() is not None,
+                    "inject": bool(desktop_inject_info()),
                 })
             elif path == "/sessions":
                 groups = {i: {"index": i, "dir": d, "sessions": []}
@@ -731,7 +732,7 @@ class Handler(BaseHTTPRequestHandler):
                             "error": "session is open in another process",
                             "locked": True,
                             "canTakeover": bool(find_holder(sid)),
-                            "canInject": desktop_inject_info() is not None,
+                            "canInject": bool(desktop_inject_info()),
                         })
                         return
                 client = acp_for(ws)
