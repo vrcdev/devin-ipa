@@ -24,11 +24,11 @@ MARKER = "devin-local-bridge inject patch"
 SESSION_HOOKS = [
     (
         "loadSession(A){return this.connection.sendRequest(SS,A,uP)",
-        "loadSession(A){try{globalThis.__devinConn=this.connection}catch(__e){}return this.connection.sendRequest(SS,A,uP)",
+        "loadSession(A){try{globalThis.__devinConn=this.connection;(globalThis.__devinConns=globalThis.__devinConns||{})[A&&A.sessionId]=this.connection}catch(__e){}return this.connection.sendRequest(SS,A,uP)",
     ),
     (
         "resumeSession(A){return this.connection.sendRequest(JS,A)",
-        "resumeSession(A){try{globalThis.__devinConn=this.connection}catch(__e){}return this.connection.sendRequest(JS,A)",
+        "resumeSession(A){try{globalThis.__devinConn=this.connection;(globalThis.__devinConns=globalThis.__devinConns||{})[A&&A.sessionId]=this.connection}catch(__e){}return this.connection.sendRequest(JS,A)",
     ),
     (
         "newSession(A){return this.connection.sendRequest(MS,A)",
@@ -65,7 +65,7 @@ SERVER_SNIPPET = r'''
         req.on("end", async () => {
           try {
             const {sessionId, text} = JSON.parse(body || "{}");
-            const conn = globalThis.__devinConn;
+            const conn = (globalThis.__devinConns||{})[sessionId] || globalThis.__devinConn;
             if (!conn) return done(409, {error: "no session has been opened in this window yet"});
             conn.sendRequest("session/prompt", {sessionId, prompt: [{type: "text", text}]}).catch(() => {});
             done(200, {ok: true});
