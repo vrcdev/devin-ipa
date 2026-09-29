@@ -21,11 +21,17 @@ Environment:
                          /shell runs ARBITRARY commands as your user — the
                          token is the only thing protecting it. Keep it
                          secret and only expose the bridge on a tailnet.
+  DEVIN_API_KEY          Devin API key for ACP `authenticate`. Defaults to
+                         the windsurf_api_key in the Devin credentials.toml
+                         (populated by signing into the Devin desktop app or
+                         `devin auth login`). The app may also pass apiKey
+                         per request as a fallback.
 """
 
 import json
 import os
 import queue
+import re
 import socket
 import subprocess
 import sys
@@ -44,6 +50,30 @@ WORKSPACES = [
     for p in os.environ.get("DEVIN_WORKSPACES", "").split(_sep)
     if p.strip()
 ] or [os.getcwd()]
+
+CREDENTIALS_CANDIDATES = [
+    os.path.join(os.environ.get("APPDATA", ""), "devin", "credentials.toml"),
+    os.path.expanduser("~/.config/devin/credentials.toml"),
+    os.path.expanduser("~/.devin/credentials.toml"),
+]
+
+
+def find_api_key():
+    """ACP mode refuses local CLI credentials, but `authenticate` accepts an
+    API key in _meta.api_key. Prefer env, else pull the key the Devin
+    desktop/CLI already stored."""
+    if os.environ.get("DEVIN_API_KEY"):
+        return os.environ["DEVIN_API_KEY"].strip()
+    for path in CREDENTIALS_CANDIDATES:
+        try:
+            text = open(path, encoding="utf-8").read()
+        except OSError:
+            continue
+        m = re.search(r'windsurf_api_key\s*=\s*"(.+)"', text) or \
+            re.search(r'api_key\s*=\s*"(.+)"', text)
+        if m:
+            return m.group(1).strip()
+    return ""
 
 
 def log(*args):
@@ -120,6 +150,7 @@ class AcpClient:
     def __init__(self, cwd):
         self.cwd = cwd
         self.proc = None
+        self.authed = False
         self.next_id = 0
         self.pending = {}        # request id -> queue.Queue
         self.buffers = {}        # session id -> SessionBuffer
@@ -132,6 +163,7 @@ class AcpClient:
         with self.spawn_lock:
             if self.proc and self.proc.poll() is None:
                 return
+            self.authed = False
             self.buffers = {}
             self.pending = {}
             log(f"spawning devin acp in {self.cwd}")
@@ -157,6 +189,25 @@ class AcpClient:
                 },
                 timeout=30,
             )
+            self.authenticate()
+
+    def authenticate(self, api_key=None):
+        """ACP doesn't use local CLI creds — feed it an API key explicitly.
+        Verified shape: params._meta.api_key, methodId devin-browser."""
+        key = api_key or find_api_key()
+        if not key:
+            log("no API key found — set DEVIN_API_KEY or sign into Devin")
+            raise AcpError(
+                "no Devin API key: set DEVIN_API_KEY on the bridge or send "
+                "apiKey in the request (the app forwards your cloud token)"
+            )
+        self.request(
+            "authenticate",
+            {"methodId": "devin-browser", "_meta": {"api_key": key}},
+            timeout=60,
+        )
+        self.authed = True
+        log(f"authenticated ACP in {self.cwd}")
 
     def _read_loop(self):
         for line in self.proc.stdout:
@@ -435,6 +486,8 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     ws_index = int(body.get("ws", 0))
                     client = acp_for(ws_index)
+                if body.get("apiKey") and not client.authed:
+                    client.authenticate(body["apiKey"])
                 sid = client.new_session()
                 if prompt:
                     client.prompt_async(sid, prompt)
@@ -444,6 +497,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/message":
                 ws, sid, text = body.get("ws", 0), body.get("id", ""), body.get("text", "")
                 client = acp_for(ws)
+                if body.get("apiKey") and not client.authed:
+                    client.authenticate(body["apiKey"])
                 if sid not in client.buffers:
                     client.load(sid)
                 client.prompt_async(sid, text)

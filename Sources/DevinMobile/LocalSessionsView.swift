@@ -240,7 +240,7 @@ struct LocalSessionDetailView: View {
         guard !text.isEmpty, let client = appState.client(for: bridge) else { return }
         sending = true
         do {
-            try await client.sendMessage(ws: ws, sessionID: sessionID, text: text)
+            try await client.sendMessage(ws: ws, sessionID: sessionID, text: text, apiKey: appState.token)
             draft = ""
             await load()
         } catch {
@@ -378,7 +378,8 @@ struct NewLocalSessionView: View {
             _ = try await client.newSession(
                 ws: dir.isEmpty ? wsIndex : nil,
                 dir: dir.isEmpty ? nil : dir,
-                prompt: prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                prompt: prompt.trimmingCharacters(in: .whitespacesAndNewlines),
+                apiKey: appState.token
             )
             await onCreated()
             dismiss()

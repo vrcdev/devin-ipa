@@ -101,16 +101,19 @@ final class LocalBridgeClient {
         return try JSONDecoder().decode(BridgeTranscript.self, from: data)
     }
 
-    func sendMessage(ws: Int, sessionID: String, text: String) async throws {
-        _ = try await request("POST", "/message", body: ["ws": ws, "id": sessionID, "text": text])
+    func sendMessage(ws: Int, sessionID: String, text: String, apiKey: String? = nil) async throws {
+        var body: [String: Any] = ["ws": ws, "id": sessionID, "text": text]
+        if let apiKey, !apiKey.isEmpty { body["apiKey"] = apiKey }
+        _ = try await request("POST", "/message", body: body)
     }
 
     /// Creates a session; pass a workspace index OR a raw directory path.
     /// Returns (sessionId, wsIndex) — custom dirs join the bridge's workspace list.
-    func newSession(ws: Int? = nil, dir: String? = nil, prompt: String) async throws -> (sessionId: String, ws: Int) {
+    func newSession(ws: Int? = nil, dir: String? = nil, prompt: String, apiKey: String? = nil) async throws -> (sessionId: String, ws: Int) {
         var body: [String: Any] = ["prompt": prompt]
         if let ws { body["ws"] = ws }
         if let dir { body["dir"] = dir }
+        if let apiKey, !apiKey.isEmpty { body["apiKey"] = apiKey }
         let data = try await request("POST", "/session", body: body)
         let res = try JSONDecoder().decode(BridgeNewSessionResponse.self, from: data)
         return (res.sessionId, res.ws ?? ws ?? 0)
