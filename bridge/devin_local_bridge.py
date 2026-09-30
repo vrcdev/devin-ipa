@@ -331,9 +331,14 @@ def desktop_inject_info():
     out = []
     for cli_dir in CLI_DIR_CANDIDATES:
         for f in _g.glob(os.path.join(cli_dir, "desktop_inject*.port")):
+            # per-host files are named desktop_inject.<pid>.port — skip dead pids
+            m = re.search(r"desktop_inject\.(\d+)\.port$", f)
+            if m and not pid_alive(int(m.group(1))):
+                continue
             try:
                 port, secret = open(f).read().strip().split()
-                out.append((int(port), secret))
+                if (int(port), secret) not in out:
+                    out.append((int(port), secret))
             except (OSError, ValueError):
                 continue
     return out
