@@ -6,8 +6,13 @@ struct DevinMobileApp: App {
 
     var body: some Scene {
         WindowGroup {
-            SessionsListView()
-                .environmentObject(appState)
+            TabView {
+                SessionsListView()
+                    .tabItem { Label("Cloud", systemImage: "cloud") }
+                BridgeListView()
+                    .tabItem { Label("Local", systemImage: "desktopcomputer") }
+            }
+            .environmentObject(appState)
         }
     }
 }

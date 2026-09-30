@@ -5,13 +5,13 @@ struct StatusDot: View {
 
     private var color: Color {
         switch status {
-        case "working", "running", "resumed", "resuming", "resume_requested", "new", "claimed":
+        case "running", "resuming", "claimed", "new", "working":
             return .green
-        case "blocked", "suspend_requested", "suspended":
+        case "suspended", "waiting_for_user", "waiting_for_approval":
             return .orange
-        case "finished", "exit":
+        case "exit", "finished":
             return .gray
-        case "expired", "error":
+        case "error", "expired":
             return .red
         default:
             return .blue
@@ -26,11 +26,11 @@ struct StatusDot: View {
 }
 
 struct SessionRow: View {
-    let session: SessionSummary
+    let session: Session
 
     var body: some View {
         HStack(spacing: 12) {
-            StatusDot(status: session.statusEnum ?? session.status)
+            StatusDot(status: session.statusDetail ?? session.status)
             VStack(alignment: .leading, spacing: 4) {
                 Text(session.title ?? session.sessionId)
                     .font(.headline)
@@ -46,7 +46,7 @@ struct SessionRow: View {
                 .foregroundStyle(.secondary)
             }
             Spacer()
-            if session.pullRequest != nil {
+            if let prs = session.pullRequests, !prs.isEmpty {
                 Image(systemName: "arrow.triangle.pull")
                     .foregroundStyle(.secondary)
             }
@@ -88,7 +88,7 @@ struct SessionsListView: View {
                 }
             }
             .task { await appState.refresh() }
-            .navigationDestination(for: SessionSummary.self) { session in
+            .navigationDestination(for: Session.self) { session in
                 SessionDetailView(sessionID: session.sessionId)
                     .environmentObject(appState)
             }
