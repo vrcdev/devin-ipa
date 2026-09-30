@@ -23,6 +23,10 @@ MARKER = "devin-local-bridge inject patch"
 
 SESSION_HOOKS = [
     (
+        "sendRequest(A,e,t,i={}){if(this.abortController.signal.aborted)",
+        "sendRequest(A,e,t,i={}){try{globalThis.__devinConn=this;(globalThis.__devinConnSet=globalThis.__devinConnSet||[]).indexOf(this)<0&&globalThis.__devinConnSet.push(this);e&&e.sessionId&&((globalThis.__devinConns=globalThis.__devinConns||{})[e.sessionId]=this)}catch(__e){}if(this.abortController.signal.aborted)",
+    ),
+    (
         "initialize(A){return this.connection.sendRequest(wS,A)}",
         "initialize(A){try{globalThis.__devinConn=this.connection;(globalThis.__devinConnSet=globalThis.__devinConnSet||[]).indexOf(this.connection)<0&&globalThis.__devinConnSet.push(this.connection)}catch(__e){}return this.connection.sendRequest(wS,A)}",
     ),
